@@ -22,6 +22,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/snowplow/snowplow-golang-tracker/v3/pkg/common"
@@ -62,6 +63,7 @@ type Emitter struct {
 	SendChannel   chan bool
 	Callback      func(successCount []CallbackResult, failureCount []CallbackResult)
 	HttpClient    *http.Client
+	mu            sync.Mutex // Protects SendChannel from concurrent access
 }
 
 // InitEmitter creates a new Emitter object which handles
@@ -183,18 +185,31 @@ func (e *Emitter) Flush() {
 
 // Stop waits for the send channel to have a value and then resets it to nil.
 func (e *Emitter) Stop() {
-	<-e.SendChannel
-	e.SendChannel = nil
+	e.mu.Lock()
+	ch := e.SendChannel
+	e.mu.Unlock()
+
+	if ch != nil {
+		<-ch // Wait for completion outside the lock
+
+		e.mu.Lock()
+		e.SendChannel = nil
+		e.mu.Unlock()
+	}
 }
 
 // start will begin the sending loop.
 func (e *Emitter) start() {
-	if e.SendChannel == nil || !e.IsSending() {
+	e.mu.Lock()
+	if e.SendChannel == nil || !e.isSending() {
 		e.SendChannel = make(chan bool, 1)
+		ch := e.SendChannel // Capture channel reference before releasing lock
+		e.mu.Unlock()
+
 		go func() {
 			var done bool
 			defer func() {
-				e.SendChannel <- done
+				ch <- done // Send to captured channel to avoid race
 			}()
 
 			for {
@@ -237,7 +252,9 @@ func (e *Emitter) start() {
 			}
 			done = true
 		}()
+		return
 	}
+	e.mu.Unlock()
 }
 
 // doSend will send all of the eventsRows it is given.
@@ -367,8 +384,15 @@ func (e *Emitter) sendPostRequest(url string, ids []int, body []payload.Payload,
 // --- Helpers
 
 // IsSending checks whether the send channel has finished.
-func (e Emitter) IsSending() bool {
-	return len(e.SendChannel) == 0
+func (e *Emitter) IsSending() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.isSending()
+}
+
+// isSending is the internal helper (caller must hold lock).
+func (e *Emitter) isSending() bool {
+	return e.SendChannel != nil && len(e.SendChannel) == 0
 }
 
 // returnCollectorUrl builds and returns the full collector URL to be used.
